@@ -130,19 +130,56 @@ class SpaceMouse(Device):
         ROBOSUITE_DEFAULT_LOGGER.info("Opening SpaceMouse device")
         self.vendor_id = vendor_id
         self.product_id = product_id
-        self.device = hid.device()
+        # self.device = hid.device()
+        # Support both pyhidapi (hid.device()) and cython-hidapi (hid.Device)
+        if hasattr(hid, "device"):
+            # pyhidapi API
+            self.device = hid.device()
+            self._hid_is_pyhidapi = True
+        else:
+            # cython-hidapi API
+            self.device = None
+            self._hid_is_pyhidapi = False
+                
+
+        # if device_path:
+        #     try:
+        #         self.device.open_path(device_path)
+        #         ROBOSUITE_DEFAULT_LOGGER.info(f"Connected using path: {device_path}")
+        #     except OSError:
+        #         ROBOSUITE_DEFAULT_LOGGER.warning(f"Failed to open device at path: {device_path}")
+        #         self._auto_detect_device()
+        # else:
+        #     try:
+        #         self.device.open(vendor_id, product_id)
+        #         ROBOSUITE_DEFAULT_LOGGER.info(f"Connected using default IDs: {vendor_id:04x}:{product_id:04x}")
+        #     except OSError:
+        #         ROBOSUITE_DEFAULT_LOGGER.warning(
+        #             f"Failed to open device with provided IDs: {vendor_id:04x}:{product_id:04x}"
+        #         )
+        #         self._auto_detect_device()
 
         if device_path:
             try:
-                self.device.open_path(device_path)
+                if self._hid_is_pyhidapi:
+                    self.device.open_path(device_path)
+                else:
+                    # cython-hidapi: open by path at construction
+                    self.device = hid.Device(path=device_path)
                 ROBOSUITE_DEFAULT_LOGGER.info(f"Connected using path: {device_path}")
             except OSError:
                 ROBOSUITE_DEFAULT_LOGGER.warning(f"Failed to open device at path: {device_path}")
                 self._auto_detect_device()
         else:
             try:
-                self.device.open(vendor_id, product_id)
-                ROBOSUITE_DEFAULT_LOGGER.info(f"Connected using default IDs: {vendor_id:04x}:{product_id:04x}")
+                if self._hid_is_pyhidapi:
+                    self.device.open(vendor_id, product_id)
+                else:
+                    # cython-hidapi: open by vid/pid at construction
+                    self.device = hid.Device(vid=vendor_id, pid=product_id)
+                ROBOSUITE_DEFAULT_LOGGER.info(
+                    f"Connected using default IDs: {vendor_id:04x}:{product_id:04x}"
+                )
             except OSError:
                 ROBOSUITE_DEFAULT_LOGGER.warning(
                     f"Failed to open device with provided IDs: {vendor_id:04x}:{product_id:04x}"
@@ -152,8 +189,8 @@ class SpaceMouse(Device):
         self.pos_sensitivity = pos_sensitivity
         self.rot_sensitivity = rot_sensitivity
 
-        ROBOSUITE_DEFAULT_LOGGER.info("Manufacturer: %s" % self.device.get_manufacturer_string())
-        ROBOSUITE_DEFAULT_LOGGER.info("Product: %s" % self.device.get_product_string())
+        # ROBOSUITE_DEFAULT_LOGGER.info("Manufacturer: %s" % self.device.get_manufacturer_string())
+        # ROBOSUITE_DEFAULT_LOGGER.info("Product: %s" % self.device.get_product_string())
 
         # 6-DOF variables
         self.x, self.y, self.z = 0, 0, 0
@@ -185,8 +222,14 @@ class SpaceMouse(Device):
         if not devices:
             raise OSError("No 3Dconnexion devices found")
 
+        # selected = devices[0]
+        # self.device.open_path(selected["path"])
         selected = devices[0]
-        self.device.open_path(selected["path"])
+        path = selected["path"]
+        if self._hid_is_pyhidapi:
+            self.device.open_path(path)
+        else:
+            self.device = hid.Device(path=path)
         self.vendor_id = selected["vendor_id"]
         self.product_id = selected["product_id"]
         ROBOSUITE_DEFAULT_LOGGER.info(f"Auto-detected: {selected['product_string']} with path {selected['path']}")
