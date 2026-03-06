@@ -559,24 +559,34 @@ class Wipe(ManipulationEnv):
         )
 
     def _setup_observables(self):
-        """
-        Sets up observables to be used for this environment. Creates object-based observables if enabled
-
-        Returns:
-            OrderedDict: Dictionary mapping observable names to its corresponding Observable object
-        """
         observables = super()._setup_observables()
-
-        # Get prefix from robot model to avoid naming clashes for multiple robots
         pf = self.robots[0].robot_model.naming_prefix
         modality = "object"
 
+        # --- Force / torque obs (already fine) ---
+        if self.use_robot_obs:
+            @sensor(modality=f"{pf}proprio")
+            def ee_force(obs_cache):
+                vals = []
+                for arm in self.robots[0].arms:
+                    vals.append(np.array(self.robots[0].ee_force[arm] - self.ee_force_bias[arm], dtype=np.float32))
+                return np.concatenate(vals, axis=0) if len(vals) > 1 else vals[0]
+
+            @sensor(modality=f"{pf}proprio")
+            def ee_torque(obs_cache):
+                vals = []
+                for arm in self.robots[0].arms:
+                    vals.append(np.array(self.robots[0].ee_torque[arm] - self.ee_torque_bias[arm], dtype=np.float32))
+                return np.concatenate(vals, axis=0) if len(vals) > 1 else vals[0]
+
+            observables[f"{pf}ee_force"] = Observable(f"{pf}ee_force", ee_force, sampling_rate=self.control_freq)
+            observables[f"{pf}ee_torque"] = Observable(f"{pf}ee_torque", ee_torque, sampling_rate=self.control_freq)
+
+        # --- Non-object sensors (contact) ---
         sensors = []
         names = []
 
-        # Add binary contact observation
         if self.use_contact_obs:
-
             @sensor(modality=f"{pf}proprio")
             def gripper_contact(obs_cache):
                 return self._has_gripper_contact
@@ -584,7 +594,11 @@ class Wipe(ManipulationEnv):
             sensors.append(gripper_contact)
             names.append(f"{pf}contact")
 
-        # object information in the observation
+        # Register the non-object sensors HERE (regardless of use_object_obs)
+        for name, s in zip(names, sensors):
+            observables[name] = Observable(name=name, sensor=s, sampling_rate=self.control_freq)
+
+        # --- Object sensors ---
         if self.use_object_obs:
 
             if self.use_condensed_obj_obs:
@@ -694,6 +708,11 @@ class Wipe(ManipulationEnv):
         # ee resets - bias at initial state
         self.ee_force_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
         self.ee_torque_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
+
+        # Set bias immediately on reset so first obs is bias-corrected
+        for arm in self.robots[0].arms:
+            self.ee_force_bias[arm] = np.array(self.robots[0].ee_force[arm])
+            self.ee_torque_bias[arm] = np.array(self.robots[0].ee_torque[arm])
 
     def _check_success(self):
         """

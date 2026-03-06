@@ -23,6 +23,16 @@ import numpy as np
 
 import robosuite
 
+def get_state_dim_original(f, ep, env):
+    """
+    Returns the original mujoco flattened state dimension for this episode.
+    Falls back to env.sim.get_state().flatten().shape[0] if attribute is missing.
+    """
+    grp = f[f"data/{ep}"]
+    if "state_dim_original" in grp.attrs:
+        return int(grp.attrs["state_dim_original"])
+    return int(env.sim.get_state().flatten().shape[0])
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -74,12 +84,19 @@ if __name__ == "__main__":
         env.viewer.set_camera(0)
 
         # load the flattened mujoco states
+        # states = f["data/{}/states".format(ep)][()]
         states = f["data/{}/states".format(ep)][()]
+        S = get_state_dim_original(f, ep, env)
+
+        ft = states[:, S:]   # shape (T, 6*K) if you appended force+torque
+        print("FT shape:", ft.shape)
+        print("First timestep FT:", ft[0])
 
         if args.use_actions:
 
             # load the initial state
-            env.sim.set_state_from_flattened(states[0])
+            # env.sim.set_state_from_flattened(states[0])
+            env.sim.set_state_from_flattened(states[0][:S])
             env.sim.forward()
 
             # load the actions and play them back open-loop
@@ -92,16 +109,21 @@ if __name__ == "__main__":
 
                 if j < num_actions - 1:
                     # ensure that the actions deterministically lead to the same recorded states
+                    # state_playback = env.sim.get_state().flatten()
+                    # if not np.all(np.equal(states[j + 1], state_playback)):
+                    #     err = np.linalg.norm(states[j + 1] - state_playback)
                     state_playback = env.sim.get_state().flatten()
-                    if not np.all(np.equal(states[j + 1], state_playback)):
-                        err = np.linalg.norm(states[j + 1] - state_playback)
+                    target = states[j + 1][:S]
+                    if not np.all(np.equal(target, state_playback)):
+                        err = np.linalg.norm(target - state_playback)
                         print(f"[warning] playback diverged by {err:.2f} for ep {ep} at step {j}")
 
         else:
 
             # force the sequence of internal mujoco states one by one
             for state in states:
-                env.sim.set_state_from_flattened(state)
+            #     env.sim.set_state_from_flattened(state)
+                env.sim.set_state_from_flattened(state[:S])
                 env.sim.forward()
                 if env.renderer == "mjviewer":
                     env.viewer.update()
