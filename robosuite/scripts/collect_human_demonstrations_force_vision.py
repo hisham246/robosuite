@@ -76,46 +76,86 @@ def read_ft_from_wrapper(env, key="robot0_right"):
 class DataCollectionWrapperWithFT(DataCollectionWrapper):
     def __init__(self, env, directory,
                  force_sensor_name="gripper0_right_force_ee",
-                 torque_sensor_name="gripper0_right_torque_ee"):
+                 torque_sensor_name="gripper0_right_torque_ee",
+                 key="robot0_right",
+                 bias_when_ncon_zero=True):
         super().__init__(env, directory)
         self.force_sensor_name = force_sensor_name
         self.torque_sensor_name = torque_sensor_name
+        self.key = key
 
-        # optional bias (see note below)
+        self._ft_sensor_cache = None  # (adr_f, dim_f, adr_t, dim_t)
         self._bias_F = None
         self._bias_T = None
+        self.bias_when_ncon_zero = bias_when_ncon_zero
+
+        self.bias_alpha = 0.02   # 0.01-0.05 typical. Higher = faster re-zero.
+        self.bias_contact_gate = 0  # 0 = use ncon==0, or use your own threshold
 
     def reset(self):
+        # reset per-episode bias
         self._bias_F = None
         self._bias_T = None
         return super().reset()
+
+    def _unwrap_to_base_env(self):
+        # peel wrappers to reach the base env that actually owns `sim`
+        e = self.env
+        while hasattr(e, "env"):
+            # stop when we find an object with `sim`
+            if hasattr(e, "sim"):
+                break
+            e = e.env
+        return e
+
+    def _get_ft_sensor_slices(self):
+        if self._ft_sensor_cache is not None:
+            return self._ft_sensor_cache
+
+        base = self._unwrap_to_base_env()
+        sim = base.sim
+
+        f_id = sim.model.sensor_name2id(self.force_sensor_name)
+        t_id = sim.model.sensor_name2id(self.torque_sensor_name)
+
+        adr_f = int(sim.model.sensor_adr[f_id]); dim_f = int(sim.model.sensor_dim[f_id])
+        adr_t = int(sim.model.sensor_adr[t_id]); dim_t = int(sim.model.sensor_dim[t_id])
+
+        self._ft_sensor_cache = (adr_f, dim_f, adr_t, dim_t)
+        return self._ft_sensor_cache
 
     def step(self, action):
         ret = super().step(action)
 
         if self.action_infos:
-            # MuJoCo-native sensor read through robosuite API
-            F_raw = np.asarray(self.env.get_sensor_measurement(self.force_sensor_name), dtype=np.float32).reshape(-1)
-            T_raw = np.asarray(self.env.get_sensor_measurement(self.torque_sensor_name), dtype=np.float32).reshape(-1)
+            base = self._unwrap_to_base_env()
+            sim = base.sim
 
-            # sanity: these should be length 3 each
-            F_raw = F_raw[:3]
-            T_raw = T_raw[:3]
+            adr_f, dim_f, adr_t, dim_t = self._get_ft_sensor_slices()
 
-            # bias: only set bias when not in contact, otherwise you "learn" contact as bias
-            # (see below — you can gate on ncon == 0)
+            ncon = int(sim.data.ncon)
+
+
+            F_raw = np.asarray(sim.data.sensordata[adr_f:adr_f + dim_f], dtype=np.float32).reshape(-1)[:3]
+            T_raw = np.asarray(sim.data.sensordata[adr_t:adr_t + dim_t], dtype=np.float32).reshape(-1)[:3]
+
             if self._bias_F is None:
                 self._bias_F = F_raw.copy()
                 self._bias_T = T_raw.copy()
 
+            # Update bias ONLY when no contact
+            if ncon == 0:
+                a = float(self.bias_alpha)
+                self._bias_F = (1 - a) * self._bias_F + a * F_raw
+                self._bias_T = (1 - a) * self._bias_T + a * T_raw
+
             F = F_raw - self._bias_F
             Tau = T_raw - self._bias_T
 
-            self.action_infos[-1]["ee_force"] = {"robot0_right": F}
-            self.action_infos[-1]["ee_torque"] = {"robot0_right": Tau}
+            self.action_infos[-1]["ee_force"] = {self.key: F}
+            self.action_infos[-1]["ee_torque"] = {self.key: Tau}
 
         return ret
-    
 
 def compute_ft_from_states_via_obs(model_xml_str, env_info_dict, states_arr):
     """
@@ -227,25 +267,6 @@ def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode):
             all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
 
         env.step(env_action)
-        sim = env.env.sim if hasattr(env, "env") else env.sim  # in case of wrappers
-        print("ncon =", sim.data.ncon)
-
-        # show largest contact force norm (from constraints) roughly
-        if sim.data.ncon > 0:
-            # print bodies involved in contacts and their cfrc_ext norm
-            max_norm = 0.0
-            max_body = None
-            for i in range(sim.data.ncon):
-                c = sim.data.contact[i]
-                b1 = sim.model.geom_bodyid[c.geom1]
-                b2 = sim.model.geom_bodyid[c.geom2]
-                n1 = float(np.linalg.norm(sim.data.cfrc_ext[b1][:3]))
-                n2 = float(np.linalg.norm(sim.data.cfrc_ext[b2][:3]))
-                if n1 > max_norm:
-                    max_norm, max_body = n1, b1
-                if n2 > max_norm:
-                    max_norm, max_body = n2, b2
-            print("max |F| from cfrc_ext =", max_norm, "on body", sim.model.body_id2name(max_body))
         env.render()
 
         F, Tau = read_ft_from_wrapper(env, key="robot0_right")
