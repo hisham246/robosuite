@@ -32,7 +32,7 @@ DEFAULT_WIPE_CONFIG = {
     # settings for thresholds
     "contact_threshold": 1.0,  # Minimum eef force to qualify as contact [N]
     "pressure_threshold": 0.5,  # force threshold (N) to overcome to get increased contact wiping reward
-    "pressure_threshold_max": 60.0,  # maximum force allowed (N)
+    "pressure_threshold_max": 100.0,  # maximum force allowed (N)
     # misc settings
     "print_results": False,  # Whether to print results or not
     "get_info": False,  # Whether to grab info after each env step if not

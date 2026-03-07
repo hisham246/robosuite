@@ -13,6 +13,7 @@ from glob import glob
 
 import h5py
 import numpy as np
+import shutil
 
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
@@ -27,51 +28,12 @@ def read_ft_from_wrapper(env, key="robot0_right"):
     if not hasattr(env, "action_infos") or (len(env.action_infos) == 0):
         return None, None
     ai = env.action_infos[-1]
-    fd = ai.get("ee_force", None)
-    td = ai.get("ee_torque", None)
+    fd = ai.get("ee_force_scaled", None)
+    td = ai.get("ee_torque_scaled", None)
     if (fd is None) or (td is None):
         return None, None
     return fd.get(key, None), td.get(key, None)
 
-# class DataCollectionWrapperWithFT(DataCollectionWrapper):
-#     def __init__(self, env, directory,
-#                  force_sensor_name="gripper0_right_force_ee",
-#                  torque_sensor_name="gripper0_right_torque_ee"):
-#         super().__init__(env, directory)
-#         self._ft_sensor_names = (force_sensor_name, torque_sensor_name)
-#         self._ft_sensor_cache = None
-
-#     def _get_ft_sensor_slices(self):
-#         if self._ft_sensor_cache is not None:
-#             return self._ft_sensor_cache
-
-#         sim = self.sim
-#         f_name, t_name = self._ft_sensor_names
-
-#         f_id = sim.model.sensor_name2id(f_name)
-#         t_id = sim.model.sensor_name2id(t_name)
-
-#         adr_f, dim_f = int(sim.model.sensor_adr[f_id]), int(sim.model.sensor_dim[f_id])
-#         adr_t, dim_t = int(sim.model.sensor_adr[t_id]), int(sim.model.sensor_dim[t_id])
-
-#         self._ft_sensor_cache = (adr_f, dim_f, adr_t, dim_t)
-#         return self._ft_sensor_cache
-
-#     def step(self, action):
-#         ret = super().step(action)
-
-#         # action_infos[-1] is created by DataCollectionWrapper during super().step(action)
-#         if self.action_infos:
-#             sim = self.sim
-#             adr_f, dim_f, adr_t, dim_t = self._get_ft_sensor_slices()
-
-#             F = np.array(sim.data.sensordata[adr_f:adr_f + dim_f], dtype=np.float32)
-#             Tau = np.array(sim.data.sensordata[adr_t:adr_t + dim_t], dtype=np.float32)
-
-#             self.action_infos[-1]["ee_force"] = {"robot0_right": F}
-#             self.action_infos[-1]["ee_torque"] = {"robot0_right": Tau}
-
-#         return ret
 
 class DataCollectionWrapperWithFT(DataCollectionWrapper):
     def __init__(self, env, directory,
@@ -89,7 +51,7 @@ class DataCollectionWrapperWithFT(DataCollectionWrapper):
         self._bias_T = None
         self.bias_when_ncon_zero = bias_when_ncon_zero
 
-        self.bias_alpha = 0.02   # 0.01-0.05 typical. Higher = faster re-zero.
+        self.bias_alpha = 0.1   # 0.01-0.05 typical. Higher = faster re-zero.
         self.bias_contact_gate = 0  # 0 = use ncon==0, or use your own threshold
 
     def reset(self):
@@ -152,8 +114,31 @@ class DataCollectionWrapperWithFT(DataCollectionWrapper):
             F = F_raw - self._bias_F
             Tau = T_raw - self._bias_T
 
+            ft_scale = 1000.0
+
             self.action_infos[-1]["ee_force"] = {self.key: F}
             self.action_infos[-1]["ee_torque"] = {self.key: Tau}
+            self.action_infos[-1]["ee_force_scaled"] = {self.key: F * ft_scale}
+            self.action_infos[-1]["ee_torque_scaled"] = {self.key: Tau * ft_scale}
+
+            # -------------------------
+            # Camera logging
+            # -------------------------
+            obs = self.env._get_observations()
+
+            if not hasattr(self, "_printed_obs_keys"):
+                print("\nObservation keys:", list(obs.keys()))
+                image_keys = [k for k in obs.keys() if "image" in k]
+                print("Image keys:", image_keys)
+                self._printed_obs_keys = True
+
+            image_obs = {}
+            for k, v in obs.items():
+                if "image" in k and isinstance(v, np.ndarray):
+                    image_obs[k] = v.copy()
+
+            self.action_infos[-1]["image_obs"] = image_obs
+
 
         return ret
 
@@ -337,6 +322,7 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         actions = []
         ee_forces = []
         ee_torques = []
+        image_obs_per_step = []
         success = False
 
         for state_file in state_files:
@@ -347,9 +333,9 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
 
             for ai in dic["action_infos"]:
                 actions.append(ai["actions"])
-                ee_forces.append(ai.get("ee_force", None))
-                ee_torques.append(ai.get("ee_torque", None))
-
+                ee_forces.append(ai.get("ee_force_scaled", None))
+                ee_torques.append(ai.get("ee_torque_scaled", None))
+                image_obs_per_step.append(ai.get("image_obs", {}))
             success = success or bool(dic["successful"])
 
         if len(states) == 0:
@@ -422,7 +408,51 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         ep_data_grp.create_dataset("states", data=states_ext)
         ep_data_grp.create_dataset("actions", data=np.asarray(actions))
 
-        print(f"Saved {demo_name} (success={success}) with states shape {states_ext.shape}")
+        # Save camera observations if present anywhere in the episode
+        all_image_keys = sorted(
+            set().union(*[
+                step_obs.keys() for step_obs in image_obs_per_step
+                if isinstance(step_obs, dict) and len(step_obs) > 0
+            ])
+        ) if len(image_obs_per_step) > 0 else []
+
+        if len(all_image_keys) > 0:
+            obs_grp = ep_data_grp.create_group("obs")
+
+            for k in all_image_keys:
+                imgs = []
+                missing = False
+
+                for step_obs in image_obs_per_step:
+                    if not isinstance(step_obs, dict) or k not in step_obs:
+                        missing = True
+                        break
+                    imgs.append(step_obs[k])
+
+                if missing:
+                    print(f"Warning: skipping image key '{k}' because it is missing in some timesteps")
+                    continue
+
+                imgs = np.stack(imgs, axis=0)
+                obs_grp.create_dataset(
+                    k,
+                    data=imgs,
+                    compression="gzip",
+                    compression_opts=4,
+                )
+                print(f"Saved image stream '{k}' with shape {imgs.shape}")
+        else:
+            print("No image observations found for this episode.")
+        
+        # shutil.rmtree(ep_path)
+
+        print("Number of image_obs_per_step entries:", len(image_obs_per_step))
+        if len(image_obs_per_step) > 0:
+            print("First step image keys:", list(image_obs_per_step[0].keys()) if isinstance(image_obs_per_step[0], dict) else image_obs_per_step[0])
+            nonempty_idx = next((i for i, d in enumerate(image_obs_per_step) if isinstance(d, dict) and len(d) > 0), None)
+            print("First non-empty image_obs index:", nonempty_idx)
+            if nonempty_idx is not None:
+                print("Keys at first non-empty step:", list(image_obs_per_step[nonempty_idx].keys()))
 
     # Write / update metadata
     now = datetime.datetime.now()
@@ -542,17 +572,33 @@ if __name__ == "__main__":
     if "TwoArm" in args.environment:
         config["env_configuration"] = args.config
 
-    # Create environment
+    # # Create environment
+    # env = suite.make(
+    #     **config,
+    #     has_renderer=True,
+    #     renderer=args.renderer,
+    #     has_offscreen_renderer=False,
+    #     render_camera=args.camera,
+    #     ignore_done=True,
+    #     use_camera_obs=False,
+    #     reward_shaping=True,
+    #     control_freq=20,
+    # )
+
     env = suite.make(
-        **config,
-        has_renderer=True,
-        renderer=args.renderer,
-        has_offscreen_renderer=False,
-        render_camera=args.camera,
-        ignore_done=True,
-        use_camera_obs=False,
-        reward_shaping=True,
-        control_freq=20,
+    **config,
+    has_renderer=True,
+    renderer=args.renderer,
+    has_offscreen_renderer=True,
+    render_camera=args.camera[0] if isinstance(args.camera, list) else args.camera,
+    ignore_done=True,
+    use_camera_obs=True,
+    camera_names=args.camera,
+    camera_heights=256,
+    camera_widths=256,
+    camera_depths=False,
+    reward_shaping=True,
+    control_freq=20,
     )
 
     # Wrap this with visualization wrapper
@@ -564,7 +610,27 @@ if __name__ == "__main__":
     # wrap the environment with data collection wrapper
     tmp_directory = "/tmp/{}".format(str(time.time()).replace(".", "_"))
     env = DataCollectionWrapperWithFT(env, tmp_directory)
-    # env = DataCollectionWrapperWithFT(env, tmp_directory, ft_site_name="gripper0_right_ft_frame", use_site_frame=True)
+
+    # IMPORTANT: build / initialize sim
+    env.reset()
+
+    # ---- ADD THIS BLOCK HERE ----
+    base = env
+    while hasattr(base, "env") and (not hasattr(base, "sim")):
+        base = base.env
+    sim = base.sim
+
+    print("Sensors in model:")
+    for i in range(sim.model.nsensor):
+        # depending on mujoco version, either of these works:
+        try:
+            sname = sim.model.sensor(i).name
+            stype = sim.model.sensor(i).type
+        except Exception:
+            sname = sim.model.sensor_id2name(i)
+            stype = int(sim.model.sensor_type[i])
+        print(i, sname, stype)
+    # ---- END BLOCK ----
 
     # initialize device
     if args.device == "keyboard":
@@ -605,8 +671,22 @@ if __name__ == "__main__":
     new_dir = os.path.join(args.directory, "{}_{}".format(t1, t2))
     os.makedirs(new_dir)
 
-    # collect demonstrations
-    while True:
-        collect_human_trajectory(env, device, args.arm, args.max_fr, args.goal_update_mode)
-        # gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info)
-        gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info, save_only_success=False)
+    try:
+        # collect demonstrations
+        while True:
+            collect_human_trajectory(env, device, args.arm, args.max_fr, args.goal_update_mode)
+            # gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info)
+            gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info, save_only_success=False)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Cleaning up...")
+    finally:
+        # close env safely
+        try:
+            env.close()
+        except Exception:
+            pass
+
+        # remove the whole temporary collection directory once at the very end
+        if os.path.exists(tmp_directory):
+            shutil.rmtree(tmp_directory)
+            print(f"Removed temporary directory: {tmp_directory}")
