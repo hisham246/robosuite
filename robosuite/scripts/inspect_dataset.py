@@ -2,7 +2,7 @@ import h5py
 import numpy as np
 import os
 
-path = "/home/hisham246/uwaterloo/robosuite_datasets/table_wiping/1772920964_7338748/demo.hdf5"
+path = "/home/hisham246/uwaterloo/robosuite_datasets/table_wiping/1772928862_7047362/demo.hdf5"
 
 def summarize_array(name, arr, max_preview=8):
     print(f"    {name}: shape={arr.shape}, dtype={arr.dtype}")

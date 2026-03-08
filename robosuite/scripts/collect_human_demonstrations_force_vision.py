@@ -121,9 +121,8 @@ class DataCollectionWrapperWithFT(DataCollectionWrapper):
             self.action_infos[-1]["ee_force_scaled"] = {self.key: F * ft_scale}
             self.action_infos[-1]["ee_torque_scaled"] = {self.key: Tau * ft_scale}
 
-            # -------------------------
+
             # Camera logging
-            # -------------------------
             obs = self.env._get_observations()
 
             if not hasattr(self, "_printed_obs_keys"):
@@ -291,8 +290,8 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
     """
     Gathers raw demos in `directory` (tmp folder with ep_*/state_*.npz) into out_dir/demo.hdf5.
 
-    - If save_only_success=True: only saves successful rollouts (legacy behavior)
-    - Otherwise: saves all rollouts, and stores success as an attribute.
+    - If save_only_success=True: only saves successful rollouts
+    - Otherwise: saves all rollouts and stores success as an attribute
 
     Also appends end-effector force+torque into `states`:
       states_ext = [mujoco_flat_state, ee_force(3), ee_torque(3)]
@@ -302,7 +301,6 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
     f = h5py.File(hdf5_path, "a")
     grp = f.require_group("data")
 
-    # Determine current index (so we append demo_{n+1}, demo_{n+2}, ...)
     existing = [k for k in grp.keys() if k.startswith("demo_")]
     num_eps = len(existing)
 
@@ -311,6 +309,11 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
     for ep_directory in sorted(os.listdir(directory)):
         ep_path = os.path.join(directory, ep_directory)
         if not os.path.isdir(ep_path):
+            continue
+
+        # skip already processed raw episodes
+        done_flag = os.path.join(ep_path, ".gathered")
+        if os.path.exists(done_flag):
             continue
 
         state_paths = os.path.join(ep_path, "state_*.npz")
@@ -336,13 +339,19 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
                 ee_forces.append(ai.get("ee_force_scaled", None))
                 ee_torques.append(ai.get("ee_torque_scaled", None))
                 image_obs_per_step.append(ai.get("image_obs", {}))
+
             success = success or bool(dic["successful"])
 
         if len(states) == 0:
+            # still mark as processed so it doesn't get checked forever
+            with open(done_flag, "w") as f_done:
+                f_done.write("empty\n")
             continue
 
         if save_only_success and (not success):
-            print("Demonstration unsuccessful -> skipping (save_only_success=True)")
+            print(f"{ep_directory}: unsuccessful -> skipping")
+            with open(done_flag, "w") as f_done:
+                f_done.write("skipped_unsuccessful\n")
             continue
 
         # DataCollectionWrapper has one extra state at the end
@@ -354,7 +363,7 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         states_arr = np.asarray(states)
         T, S = states_arr.shape
 
-        # Determine stable FT key order (you have ['robot0_right'])
+        # Determine stable FT key order
         keys = None
         for d in ee_forces:
             if d is not None:
@@ -362,16 +371,13 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
                 break
 
         if keys is None:
-            # Fallback: compute FT by replaying recorded mujoco states and reading robosuite obs
-            # (works even if DataCollectionWrapper didn't store ee_force/ee_torque)
             xml_path = os.path.join(ep_path, "model.xml")
             with open(xml_path, "r") as xf:
                 model_xml_str = xf.read()
 
             env_info_dict = json.loads(env_info) if isinstance(env_info, str) else dict(env_info)
-
-            ft_arr = compute_ft_from_states_via_obs(model_xml_str, env_info_dict, states_arr)  # (T,6)
-            keys = ["robot0_right"]  # stable label for bookkeeping
+            ft_arr = compute_ft_from_states_via_obs(model_xml_str, env_info_dict, states_arr)
+            keys = ["robot0_right"]
         else:
             K = len(keys)
             force_arr = np.zeros((T, 3 * K), dtype=np.float32)
@@ -383,10 +389,10 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
                 if (fd is None) or (td is None):
                     continue
                 for j, k in enumerate(keys):
-                    force_arr[t, 3*j:3*j+3] = np.asarray(fd[k], dtype=np.float32)
-                    torque_arr[t, 3*j:3*j+3] = np.asarray(td[k], dtype=np.float32)
+                    force_arr[t, 3 * j:3 * j + 3] = np.asarray(fd[k], dtype=np.float32)
+                    torque_arr[t, 3 * j:3 * j + 3] = np.asarray(td[k], dtype=np.float32)
 
-            ft_arr = np.concatenate([force_arr, torque_arr], axis=1)  # (T, 6*K)
+            ft_arr = np.concatenate([force_arr, torque_arr], axis=1)
 
         states_ext = np.concatenate([states_arr, ft_arr], axis=1)
 
@@ -394,7 +400,6 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         demo_name = f"demo_{num_eps}"
         ep_data_grp = grp.create_group(demo_name)
 
-        # model xml
         xml_path = os.path.join(ep_path, "model.xml")
         with open(xml_path, "r") as xf:
             ep_data_grp.attrs["model_file"] = xf.read()
@@ -408,13 +413,23 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         ep_data_grp.create_dataset("states", data=states_ext)
         ep_data_grp.create_dataset("actions", data=np.asarray(actions))
 
-        # Save camera observations if present anywhere in the episode
+        # Save image observations if present
         all_image_keys = sorted(
             set().union(*[
-                step_obs.keys() for step_obs in image_obs_per_step
+                step_obs.keys()
+                for step_obs in image_obs_per_step
                 if isinstance(step_obs, dict) and len(step_obs) > 0
             ])
         ) if len(image_obs_per_step) > 0 else []
+
+        for k in all_image_keys:
+            missing_idx = [
+                i for i, step_obs in enumerate(image_obs_per_step)
+                if (not isinstance(step_obs, dict)) or (k not in step_obs)
+            ]
+            print(f"{k}: missing at {len(missing_idx)} timesteps")
+            if len(missing_idx) > 0:
+                print("first few missing indices:", missing_idx[:10])
 
         if len(all_image_keys) > 0:
             obs_grp = ep_data_grp.create_group("obs")
@@ -441,20 +456,13 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
                     compression_opts=4,
                 )
                 print(f"Saved image stream '{k}' with shape {imgs.shape}")
-        else:
-            print("No image observations found for this episode.")
-        
-        # shutil.rmtree(ep_path)
 
-        print("Number of image_obs_per_step entries:", len(image_obs_per_step))
-        if len(image_obs_per_step) > 0:
-            print("First step image keys:", list(image_obs_per_step[0].keys()) if isinstance(image_obs_per_step[0], dict) else image_obs_per_step[0])
-            nonempty_idx = next((i for i, d in enumerate(image_obs_per_step) if isinstance(d, dict) and len(d) > 0), None)
-            print("First non-empty image_obs index:", nonempty_idx)
-            if nonempty_idx is not None:
-                print("Keys at first non-empty step:", list(image_obs_per_step[nonempty_idx].keys()))
+        print(f"Saved {demo_name} from {ep_directory} (success={success}) with states shape {states_ext.shape}")
 
-    # Write / update metadata
+        # mark raw episode as already gathered
+        with open(done_flag, "w") as f_done:
+            f_done.write("done\n")
+
     now = datetime.datetime.now()
     grp.attrs["date"] = "{}-{}-{}".format(now.month, now.day, now.year)
     grp.attrs["time"] = "{}:{}:{}".format(now.hour, now.minute, now.second)
@@ -572,18 +580,6 @@ if __name__ == "__main__":
     if "TwoArm" in args.environment:
         config["env_configuration"] = args.config
 
-    # # Create environment
-    # env = suite.make(
-    #     **config,
-    #     has_renderer=True,
-    #     renderer=args.renderer,
-    #     has_offscreen_renderer=False,
-    #     render_camera=args.camera,
-    #     ignore_done=True,
-    #     use_camera_obs=False,
-    #     reward_shaping=True,
-    #     control_freq=20,
-    # )
 
     env = suite.make(
     **config,
@@ -594,8 +590,8 @@ if __name__ == "__main__":
     ignore_done=True,
     use_camera_obs=True,
     camera_names=args.camera,
-    camera_heights=256,
-    camera_widths=256,
+    camera_heights=224,
+    camera_widths=224,
     camera_depths=False,
     reward_shaping=True,
     control_freq=20,
@@ -614,7 +610,6 @@ if __name__ == "__main__":
     # IMPORTANT: build / initialize sim
     env.reset()
 
-    # ---- ADD THIS BLOCK HERE ----
     base = env
     while hasattr(base, "env") and (not hasattr(base, "sim")):
         base = base.env
@@ -630,7 +625,6 @@ if __name__ == "__main__":
             sname = sim.model.sensor_id2name(i)
             stype = int(sim.model.sensor_type[i])
         print(i, sname, stype)
-    # ---- END BLOCK ----
 
     # initialize device
     if args.device == "keyboard":
@@ -675,7 +669,6 @@ if __name__ == "__main__":
         # collect demonstrations
         while True:
             collect_human_trajectory(env, device, args.arm, args.max_fr, args.goal_update_mode)
-            # gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info)
             gather_demonstrations_as_hdf5(tmp_directory, new_dir, env_info, save_only_success=False)
     except KeyboardInterrupt:
         print("\nInterrupted by user. Cleaning up...")
