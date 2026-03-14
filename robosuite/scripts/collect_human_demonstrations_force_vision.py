@@ -435,17 +435,38 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
             obs_grp = ep_data_grp.create_group("obs")
 
             for k in all_image_keys:
-                imgs = []
-                missing = False
+                imgs = [None] * T
 
-                for step_obs in image_obs_per_step:
-                    if not isinstance(step_obs, dict) or k not in step_obs:
-                        missing = True
+                # first pass: place available frames
+                for i, step_obs in enumerate(image_obs_per_step):
+                    if isinstance(step_obs, dict) and (k in step_obs):
+                        imgs[i] = step_obs[k]
+
+                # find any valid frame at all
+                valid_indices = [i for i, x in enumerate(imgs) if x is not None]
+                if len(valid_indices) == 0:
+                    print(f"Warning: no valid frames found for '{k}', skipping")
+                    continue
+
+                # fill forward
+                last_valid = None
+                for i in range(T):
+                    if imgs[i] is not None:
+                        last_valid = imgs[i]
+                    elif last_valid is not None:
+                        imgs[i] = last_valid
+
+                # fill backward for any leading None values
+                first_valid = next((x for x in imgs if x is not None), None)
+                for i in range(T):
+                    if imgs[i] is None:
+                        imgs[i] = first_valid
+                    else:
                         break
-                    imgs.append(step_obs[k])
 
-                if missing:
-                    print(f"Warning: skipping image key '{k}' because it is missing in some timesteps")
+                # final safety check
+                if any(x is None for x in imgs):
+                    print(f"Warning: could not fully reconstruct '{k}', skipping")
                     continue
 
                 imgs = np.stack(imgs, axis=0)
