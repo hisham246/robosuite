@@ -413,6 +413,8 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
         ep_data_grp.create_dataset("states", data=states_ext)
         ep_data_grp.create_dataset("actions", data=np.asarray(actions))
 
+        ep_data_grp.attrs["num_samples"] = int(T)
+
         # Save image observations if present
         all_image_keys = sorted(
             set().union(*[
@@ -489,7 +491,14 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, save_only_succes
     grp.attrs["time"] = "{}:{}:{}".format(now.hour, now.minute, now.second)
     grp.attrs["repository_version"] = suite.__version__
     grp.attrs["env"] = env_name if env_name is not None else grp.attrs.get("env", "")
+    env_info_dict = json.loads(env_info) if isinstance(env_info, str) else env_info
+    env_args = {
+        "type": 1,
+        "env_name": env_info_dict["env_name"],
+        "env_kwargs": env_info_dict,
+    }
     grp.attrs["env_info"] = env_info
+    grp.attrs["env_args"] = json.dumps(env_args)
 
     f.close()
 
