@@ -138,6 +138,16 @@ class DataCollectionWrapperWithFT(DataCollectionWrapper):
 
             self.action_infos[-1]["image_obs"] = image_obs
 
+            # save selected low-dim obs
+            low_dim_obs = {}
+
+            for k in ["robot0_eef_pos", "robot0_eef_quat"]:
+                if k in obs and isinstance(obs[k], np.ndarray):
+                    low_dim_obs[k] = obs[k].copy()
+
+            self.action_infos[-1]["image_obs"] = image_obs
+            self.action_infos[-1]["low_dim_obs"] = low_dim_obs
+
 
         return ret
 
