@@ -193,8 +193,10 @@ class Wipe(ManipulationEnv):
         ignore_done=False,
         hard_reset=True,
         camera_names="agentview",
-        camera_heights=256,
-        camera_widths=256,
+        # camera_heights=256,
+        # camera_widths=256,
+        camera_heights=224,
+        camera_widths=224,
         camera_depths=False,
         camera_segmentations=None,  # {None, instance, class, element}
         task_config=None,
@@ -269,6 +271,15 @@ class Wipe(ManipulationEnv):
         self.metadata = []
         self.spec = "spec"
 
+        # FT preprocessing state for BC_CaMI-compatible force observable
+        self._ft_sensor_cache = None
+        self._bias_F_sensor = None
+        self._bias_T_sensor = None
+        self.bias_alpha = 0.1
+        self.ft_scale = 1000.0
+        self.force_sensor_name = "gripper0_right_force_ee"
+        self.torque_sensor_name = "gripper0_right_torque_ee"
+
         # whether to include and use ground-truth object states
         self.use_object_obs = use_object_obs
 
@@ -304,6 +315,34 @@ class Wipe(ManipulationEnv):
         # set after init to ensure self.robots is set
         self.ee_force_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
         self.ee_torque_bias = {arm: np.zeros(3) for arm in self.robots[0].arms}
+
+    def _get_ft_sensor_slices(self):
+        if self._ft_sensor_cache is not None:
+            return self._ft_sensor_cache
+
+        f_id = self.sim.model.sensor_name2id(self.force_sensor_name)
+        t_id = self.sim.model.sensor_name2id(self.torque_sensor_name)
+
+        adr_f = int(self.sim.model.sensor_adr[f_id])
+        dim_f = int(self.sim.model.sensor_dim[f_id])
+        adr_t = int(self.sim.model.sensor_adr[t_id])
+        dim_t = int(self.sim.model.sensor_dim[t_id])
+
+        self._ft_sensor_cache = (adr_f, dim_f, adr_t, dim_t)
+        return self._ft_sensor_cache
+    
+    def _read_raw_ft_sensor(self):
+        adr_f, dim_f, adr_t, dim_t = self._get_ft_sensor_slices()
+
+        F_raw = np.asarray(
+            self.sim.data.sensordata[adr_f:adr_f + dim_f], dtype=np.float32
+        ).reshape(-1)[:3]
+
+        T_raw = np.asarray(
+            self.sim.data.sensordata[adr_t:adr_t + dim_t], dtype=np.float32
+        ).reshape(-1)[:3]
+
+        return F_raw, T_raw
 
     def _get_active_markers(self, c_geoms):
         """
@@ -581,6 +620,32 @@ class Wipe(ManipulationEnv):
 
             observables[f"{pf}ee_force"] = Observable(f"{pf}ee_force", ee_force, sampling_rate=self.control_freq)
             observables[f"{pf}ee_torque"] = Observable(f"{pf}ee_torque", ee_torque, sampling_rate=self.control_freq)
+        
+            @sensor(modality=f"{pf}proprio")
+            def force(obs_cache):
+                F_raw, T_raw = self._read_raw_ft_sensor()
+
+                if self._bias_F_sensor is None:
+                    self._bias_F_sensor = F_raw.copy()
+                    self._bias_T_sensor = T_raw.copy()
+
+                F = F_raw - self._bias_F_sensor
+                T = T_raw - self._bias_T_sensor
+
+                return self.ft_scale * np.concatenate([F, T], axis=0)
+            
+            observables["force"] = Observable(
+            name="force",
+            sensor=force,
+            sampling_rate=self.control_freq)
+
+            print("[WIPE SETUP DEBUG] observables keys:", list(observables.keys()))
+
+            print(
+                "[WIPE SETUP DEBUG] force observable:",
+                "enabled=", observables["force"].is_enabled(),
+                "active=", observables["force"].is_active(),
+            )
 
         # --- Non-object sensors (contact) ---
         sensors = []
@@ -691,6 +756,21 @@ class Wipe(ManipulationEnv):
             names.extend([fn.__name__ for fn in grippers_to_marker_fns])
 
         return sensors, names
+    
+    def _get_observations(self, *args, **kwargs):
+        obs = super()._get_observations(*args, **kwargs)
+
+        F_raw, T_raw = self._read_raw_ft_sensor()
+
+        if self._bias_F_sensor is None:
+            self._bias_F_sensor = F_raw.copy()
+            self._bias_T_sensor = T_raw.copy()
+
+        F = F_raw - self._bias_F_sensor
+        T = T_raw - self._bias_T_sensor
+
+        obs["force"] = (self.ft_scale * np.concatenate([F, T], axis=0)).astype(np.float32)
+        return obs
 
     def _reset_internal(self):
         super()._reset_internal()
@@ -713,6 +793,14 @@ class Wipe(ManipulationEnv):
         for arm in self.robots[0].arms:
             self.ee_force_bias[arm] = np.array(self.robots[0].ee_force[arm])
             self.ee_torque_bias[arm] = np.array(self.robots[0].ee_torque[arm])
+
+        self._ft_sensor_cache = None
+        self._bias_F_sensor = None
+        self._bias_T_sensor = None
+
+        F_raw, T_raw = self._read_raw_ft_sensor()
+        self._bias_F_sensor = F_raw.copy()
+        self._bias_T_sensor = T_raw.copy()
 
     def _check_success(self):
         """
@@ -777,6 +865,17 @@ class Wipe(ManipulationEnv):
         if all([np.linalg.norm(self.ee_force_bias[arm]) == 0 for arm in self.ee_force_bias]):
             self.ee_force_bias = self.robots[0].ee_force
             self.ee_torque_bias = self.robots[0].ee_torque
+        
+        F_raw, T_raw = self._read_raw_ft_sensor()
+
+        if self._bias_F_sensor is None:
+            self._bias_F_sensor = F_raw.copy()
+            self._bias_T_sensor = T_raw.copy()
+
+        if int(self.sim.data.ncon) == 0:
+            a = float(self.bias_alpha)
+            self._bias_F_sensor = (1 - a) * self._bias_F_sensor + a * F_raw
+            self._bias_T_sensor = (1 - a) * self._bias_T_sensor + a * T_raw
 
         if self.get_info:
             info["add_vals"] = ["nwipedmarkers", "colls", "percent_viapoints_", "f_excess"]
@@ -788,6 +887,7 @@ class Wipe(ManipulationEnv):
         # allow episode to finish early if allowed
         if self.early_terminations:
             done = done or self._check_terminated()
+    
 
         return reward, done, info
 
