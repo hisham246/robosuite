@@ -217,6 +217,15 @@ class NutAssembly(ManipulationEnv):
         # object placement initializer
         self.placement_initializer = placement_initializer
 
+        # FT preprocessing state for BC_CaMI-compatible force observable
+        self._ft_sensor_cache = None
+        self._bias_F_sensor = None
+        self._bias_T_sensor = None
+        self.bias_alpha = 0.1
+        self.ft_scale = 1000.0
+        self.force_sensor_name = "gripper0_right_force_ee"
+        self.torque_sensor_name = "gripper0_right_torque_ee"
+
         super().__init__(
             robots=robots,
             env_configuration=env_configuration,
@@ -245,6 +254,34 @@ class NutAssembly(ManipulationEnv):
             renderer_config=renderer_config,
             seed=seed,
         )
+        
+    def _get_ft_sensor_slices(self):
+        if self._ft_sensor_cache is not None:
+            return self._ft_sensor_cache
+
+        f_id = self.sim.model.sensor_name2id(self.force_sensor_name)
+        t_id = self.sim.model.sensor_name2id(self.torque_sensor_name)
+
+        adr_f = int(self.sim.model.sensor_adr[f_id])
+        dim_f = int(self.sim.model.sensor_dim[f_id])
+        adr_t = int(self.sim.model.sensor_adr[t_id])
+        dim_t = int(self.sim.model.sensor_dim[t_id])
+
+        self._ft_sensor_cache = (adr_f, dim_f, adr_t, dim_t)
+        return self._ft_sensor_cache
+
+    def _read_raw_ft_sensor(self):
+        adr_f, dim_f, adr_t, dim_t = self._get_ft_sensor_slices()
+
+        F_raw = np.asarray(
+            self.sim.data.sensordata[adr_f:adr_f + dim_f], dtype=np.float32
+        ).reshape(-1)[:3]
+
+        T_raw = np.asarray(
+            self.sim.data.sensordata[adr_t:adr_t + dim_t], dtype=np.float32
+        ).reshape(-1)[:3]
+
+        return F_raw, T_raw
 
     def reward(self, action=None):
         """
@@ -490,6 +527,28 @@ class NutAssembly(ManipulationEnv):
         """
         observables = super()._setup_observables()
 
+        pf = self.robots[0].robot_model.naming_prefix
+
+        if True:
+            @sensor(modality=f"{pf}proprio")
+            def force(obs_cache):
+                F_raw, T_raw = self._read_raw_ft_sensor()
+
+                if self._bias_F_sensor is None:
+                    self._bias_F_sensor = F_raw.copy()
+                    self._bias_T_sensor = T_raw.copy()
+
+                F = F_raw - self._bias_F_sensor
+                T = T_raw - self._bias_T_sensor
+
+                return self.ft_scale * np.concatenate([F, T], axis=0)
+
+            observables["force"] = Observable(
+                name="force",
+                sensor=force,
+                sampling_rate=self.control_freq,
+            )
+
         # low-level object information
         if self.use_object_obs:
             modality = "object"
@@ -538,7 +597,23 @@ class NutAssembly(ManipulationEnv):
                     active=active,
                 )
 
+
         return observables
+    
+    def _get_observations(self, *args, **kwargs):
+        obs = super()._get_observations(*args, **kwargs)
+
+        F_raw, T_raw = self._read_raw_ft_sensor()
+
+        if self._bias_F_sensor is None:
+            self._bias_F_sensor = F_raw.copy()
+            self._bias_T_sensor = T_raw.copy()
+
+        F = F_raw - self._bias_F_sensor
+        T = T_raw - self._bias_T_sensor
+
+        obs["force"] = (self.ft_scale * np.concatenate([F, T], axis=0)).astype(np.float32)
+        return obs
 
     def _create_nut_sensors(self, nut_name, modality="object"):
         """
@@ -586,6 +661,14 @@ class NutAssembly(ManipulationEnv):
         Resets simulation internal configurations.
         """
         super()._reset_internal()
+
+        self._ft_sensor_cache = None
+        self._bias_F_sensor = None
+        self._bias_T_sensor = None
+
+        F_raw, T_raw = self._read_raw_ft_sensor()
+        self._bias_F_sensor = F_raw.copy()
+        self._bias_T_sensor = T_raw.copy()
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
@@ -678,6 +761,22 @@ class NutAssembly(ManipulationEnv):
                     target=self.nuts[closest_nut_id].important_sites["handle"],
                     target_type="site",
                 )
+    def _post_action(self, action):
+        reward, done, info = super()._post_action(action)
+
+        F_raw, T_raw = self._read_raw_ft_sensor()
+
+        if self._bias_F_sensor is None:
+            self._bias_F_sensor = F_raw.copy()
+            self._bias_T_sensor = T_raw.copy()
+
+        # Simple adaptive bias update when not grasping / not in strong contact
+        if int(self.sim.data.ncon) == 0:
+            a = float(self.bias_alpha)
+            self._bias_F_sensor = (1 - a) * self._bias_F_sensor + a * F_raw
+            self._bias_T_sensor = (1 - a) * self._bias_T_sensor + a * T_raw
+
+        return reward, done, info
 
 
 class NutAssemblySingle(NutAssembly):
