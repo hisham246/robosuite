@@ -222,7 +222,7 @@ class NutAssembly(ManipulationEnv):
         self._bias_F_sensor = None
         self._bias_T_sensor = None
         self.bias_alpha = 0.1
-        self.ft_scale = 1000.0
+        self.ft_scale = 1.0
         self.force_sensor_name = "gripper0_right_force_ee"
         self.torque_sensor_name = "gripper0_right_torque_ee"
 
